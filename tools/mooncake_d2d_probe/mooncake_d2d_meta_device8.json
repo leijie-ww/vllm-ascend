@@ -1,0 +1,13 @@
+{
+  "addr": 20618009378816,
+  "bytes": 67108864,
+  "created_at": "2026-06-03 10:48:14",
+  "device_name": "",
+  "host": "80.5.17.106",
+  "hostname": "node-39-121",
+  "pattern": 90,
+  "pid": 1110,
+  "rpc_port": 16184,
+  "session": "80.5.17.106:16184",
+  "visible_devices": "8"
+}
