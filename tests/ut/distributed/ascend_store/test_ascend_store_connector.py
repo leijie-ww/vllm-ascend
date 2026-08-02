@@ -19,18 +19,26 @@ import types
 import unittest
 from unittest.mock import MagicMock, patch
 
-from vllm.distributed.kv_events import KVCacheEvent
-
+# isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
+from vllm.distributed.kv_events import KVCacheEvent
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector import (
     AscendStoreConnector,
     AscendStoreKVEvents,
 )
 
+# isort: on
+
+
+def _mock_events(num_workers=1):
+    events = AscendStoreKVEvents(num_workers=num_workers)
+    events._aggregator = MagicMock()
+    return events
+
 
 class TestAscendStoreKVEvents(unittest.TestCase):
     def _make_events(self, num_workers=1):
-        return AscendStoreKVEvents(num_workers=num_workers)
+        return _mock_events(num_workers=num_workers)
 
     def test_add_and_get_events(self):
         ev = self._make_events()
@@ -81,6 +89,19 @@ class TestAscendStoreConnector(unittest.TestCase):
         config.kv_transfer_config.kv_connector_extra_config = extra_config or {}
         config.parallel_config.rank = 0
         return config
+
+    def test_pp_handshake_metadata_is_ignored(self):
+        connector = AscendStoreConnector.__new__(AscendStoreConnector)
+        metadata = {
+            (0, 0): MagicMock(),
+            (1, 0): MagicMock(),
+        }
+        original_metadata = metadata.copy()
+
+        result = connector.set_xfer_handshake_metadata_pp_aware(metadata)
+
+        self.assertIsNone(result)
+        self.assertEqual(metadata, original_metadata)
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector.KVPoolScheduler")
     def test_init_scheduler_role(self, mock_scheduler_cls):
@@ -163,7 +184,7 @@ class TestAscendStoreConnector(unittest.TestCase):
             role=KVConnectorRole.SCHEDULER,
             kv_cache_config=MagicMock(),
         )
-        events = AscendStoreKVEvents(num_workers=1)
+        events = _mock_events(num_workers=1)
         mock_kv_events = [MagicMock()]
         events._aggregator.get_all_events.return_value = mock_kv_events
         events._aggregator.get_number_of_workers.return_value = 1
@@ -184,7 +205,7 @@ class TestAscendStoreConnector(unittest.TestCase):
             kv_cache_config=MagicMock(),
         )
         # First update
-        events1 = AscendStoreKVEvents(num_workers=1)
+        events1 = _mock_events(num_workers=1)
         events1._aggregator.get_all_events.return_value = [MagicMock()]
         events1._aggregator.get_number_of_workers.return_value = 1
         output1 = MagicMock()
@@ -192,7 +213,7 @@ class TestAscendStoreConnector(unittest.TestCase):
         connector.update_connector_output(output1)
 
         # Second update
-        events2 = AscendStoreKVEvents(num_workers=1)
+        events2 = _mock_events(num_workers=1)
         events2._aggregator.get_all_events.return_value = [MagicMock()]
         events2._aggregator.get_number_of_workers.return_value = 1
         output2 = MagicMock()
@@ -215,7 +236,7 @@ class TestAscendStoreConnector(unittest.TestCase):
         self.assertEqual(result, [])
 
         # With events
-        events = AscendStoreKVEvents(num_workers=1)
+        events = _mock_events(num_workers=1)
         mock_event = MagicMock()
         events._aggregator.get_common_events.return_value = [mock_event]
         events._aggregator.get_all_events.return_value = [mock_event]

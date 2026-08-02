@@ -17,13 +17,16 @@
 # This file is a part of the vllm-ascend project.
 #
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from typing import Any
 
 import numpy as np
 import torch
+import vllm
 from vllm.config import VllmConfig, get_current_vllm_config, get_layers_from_vllm_config
-from vllm.model_executor.layers.attention import MLAAttention
+from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import (
@@ -39,11 +42,47 @@ from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, AscendPrefillContextParallelMetadata
+from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.utils import calc_split_factor
 
 _ATTENTION_MASK_BUILDER = None
+
+
+def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
+    """Build Ascend-specific KV cache specs for v2 worker patching."""
+    kv_cache_spec: dict[str, KVCacheSpec] = {}
+    layer_type = AttentionLayerBase
+    attn_layers = get_layers_from_vllm_config(vllm_config, layer_type)
+
+    for layer_name, attn_module in attn_layers.items():
+        if getattr(attn_module, "kv_sharing_target_layer_name", None):
+            continue
+        if isinstance(attn_module, Attention):
+            if spec := attn_module.get_kv_cache_spec(vllm_config):
+                kv_cache_spec[layer_name] = spec
+            continue
+        if isinstance(attn_module, MLAAttention):
+            spec = attn_module.get_kv_cache_spec(vllm_config)
+            if spec is None:
+                continue
+            if getattr(attn_module.impl, "fa_quant_layer", False):
+                head_size = attn_module.head_size + attn_module.qk_rope_head_dim
+                dtype, cache_dtype_str = attn_module.impl.dtype, None
+            else:
+                head_size = spec.head_size
+                dtype = spec.dtype
+                cache_dtype_str = spec.cache_dtype_str
+            kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
+                block_size=spec.block_size,
+                num_kv_heads=spec.num_kv_heads,
+                head_size=head_size,
+                dtype=dtype,
+                cache_dtype_str=cache_dtype_str,
+            )
+
+    return kv_cache_spec
 
 
 def get_attn_mask_builder(device: torch.device):
@@ -70,14 +109,15 @@ def build_attn_metadata(
     dcp_local_seq_lens: torch.Tensor | None = None,
     # extra attributes for ascend npus.
     seq_lens_np: np.ndarray | None = None,
+    seq_lens_cpu_upper_bound: torch.Tensor | None = None,
     num_computed_tokens_cpu: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
     attn_state: Any | None = None,
     graph_pad_size: int = -1,
     num_input_tokens: int = 0,
-    prefill_context_parallel_metadata: AscendPrefillContextParallelMetadata | None = None,
     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     for_cudagraph_capture: bool = False,
+    causal: bool | Mapping[int, bool] = True,
 ) -> dict[str, Any]:
     """Build attention metadata for Ascend NPUs."""
     # TODO(Ronald1995): optimize AscendCommonAttentionMetadata.
@@ -88,12 +128,16 @@ def build_attn_metadata(
     if seq_lens_np is None:
         seq_lens_np = np.full(num_reqs, max_seq_len, dtype=np.int32)
     seq_lens_cpu = torch.from_numpy(seq_lens_np)[:num_reqs]
+    if seq_lens_cpu_upper_bound is None:
+        seq_lens_cpu_upper_bound = seq_lens_cpu
 
     attn_metadata: dict[str, Any] = {}
     kv_cache_groups = kv_cache_config.kv_cache_groups
     for i, kv_cache_spec in enumerate(kv_cache_groups):
         block_table = block_tables[i]
         slot_mapping = slot_mappings[i]
+        # Hybrid drafters can configure causality per KV cache group.
+        group_causal = causal if isinstance(causal, bool) else causal.get(i, True)
 
         common_attn_metadata_extra_kwargs = (
             model_specific_attn_metadata.get_extra_common_attn_kwargs(i, num_reqs)
@@ -104,7 +148,7 @@ def build_attn_metadata(
             query_start_loc=query_start_loc_gpu,
             query_start_loc_cpu=query_start_loc_cpu,
             seq_lens_cpu=seq_lens_cpu,
-            seq_lens_cpu_upper_bound=seq_lens_cpu,
+            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             seq_lens=seq_lens[:num_reqs],
             num_reqs=num_reqs,
             num_actual_tokens=num_tokens,
@@ -115,8 +159,8 @@ def build_attn_metadata(
             attn_state=attn_state,
             graph_pad_size=graph_pad_size,
             num_input_tokens=num_input_tokens,
-            prefill_context_parallel_metadata=prefill_context_parallel_metadata,
             max_seq_len=max_seq_len,
+            causal=group_causal,
             **common_attn_metadata_extra_kwargs,
         )
 
@@ -197,11 +241,11 @@ def _get_layer_kv_cache_specs(kv_cache_config: KVCacheConfig) -> dict[str, KVCac
 
 
 def _get_attention_kv_cache_dims(layer_name: str, kv_cache_spec: AttentionSpec) -> tuple[int, int]:
-    if isinstance(kv_cache_spec, MLAAttentionSpec):
+    if isinstance(kv_cache_spec, AscendMLAAttentionSpec):
         attn_layers = get_layers_from_vllm_config(get_current_vllm_config(), AttentionLayerBase, [layer_name])
         attn_layer = attn_layers[layer_name]
         if not isinstance(attn_layer, MLAAttention):
-            raise TypeError(f"Expected MLAAttention layer for {layer_name}, got {type(attn_layer).__name__}.")
+            raise TypeError(f"Expected AscendMLAAttention layer for {layer_name}, got {type(attn_layer).__name__}.")
         return attn_layer.kv_lora_rank, attn_layer.qk_rope_head_dim
 
     head_size_v = kv_cache_spec.head_size_v if hasattr(kv_cache_spec, "head_size_v") else kv_cache_spec.head_size
@@ -357,7 +401,7 @@ def _reshape_kv_cache(
                     kv_cache_spec.head_size,
                     cache_dtype,
                 )
-                if not isinstance(kv_cache_spec, MLAAttentionSpec):
+                if not isinstance(kv_cache_spec, AscendMLAAttentionSpec):
                     k_shape = kv_cache_shape[1:]
                     if hasattr(kv_cache_spec, "head_size_v"):
                         v_shape = (*kv_cache_shape[1:-1], kv_cache_spec.head_size_v)
@@ -395,6 +439,7 @@ def _reshape_kv_cache_v2(
     cache_dtype: str,
     kernel_block_sizes: list[int],
     shared_kv_cache_layers: dict[str, str],
+    kv_cache_config: "KVCacheConfig | None" = None,
 ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
     vllm_config = get_current_vllm_config()
     is_kv_consumer = (
@@ -436,7 +481,7 @@ def _reshape_kv_cache_v2(
                 cache_dtype,
             )
 
-            if not isinstance(kv_cache_spec, MLAAttentionSpec):
+            if not isinstance(kv_cache_spec, (AscendMLAAttentionSpec, MLAAttentionSpec)):
                 k_shape = kv_cache_shape[1:]
                 if hasattr(kv_cache_spec, "head_size_v"):
                     v_shape = (*kv_cache_shape[1:-1], kv_cache_spec.head_size_v)
@@ -462,3 +507,17 @@ def _reshape_kv_cache_v2(
         kv_caches[layer_name] = kv_caches[target_layer_name]
 
     return kv_caches
+
+
+_BUILD_ATTN_METADATA_MODULE = vllm.v1.worker.gpu.spec_decode.speculator
+
+
+@contextmanager
+def build_attn_metadata_wrapper():
+    """Context manager to override attention metadata building for Ascend NPUs."""
+    original_func = _BUILD_ATTN_METADATA_MODULE.build_attn_metadata
+    try:
+        _BUILD_ATTN_METADATA_MODULE.build_attn_metadata = build_attn_metadata
+        yield
+    finally:
+        _BUILD_ATTN_METADATA_MODULE.build_attn_metadata = original_func

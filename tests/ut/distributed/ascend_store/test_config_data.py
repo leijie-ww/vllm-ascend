@@ -15,7 +15,6 @@
 # This file is a part of the vllm-ascend project.
 #
 
-import hashlib
 import unittest
 from unittest.mock import MagicMock
 
@@ -32,20 +31,6 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     RequestTracker,
     get_block_hashes,
 )
-
-_GROUPED_BLOCK_HASH_DOMAIN = b"vllm-ascend-grouped-block-hash-v1\0"
-_GROUPED_BLOCK_HASH_LENGTH_PREFIX_BYTES = 4
-
-
-def _expected_grouped_hash(*block_hashes):
-    hasher = hashlib.sha256()
-    hasher.update(_GROUPED_BLOCK_HASH_DOMAIN)
-    hasher.update(len(block_hashes).to_bytes(_GROUPED_BLOCK_HASH_LENGTH_PREFIX_BYTES, "big"))
-    for block_hash in block_hashes:
-        hash_bytes = block_hash.encode("utf-8") if isinstance(block_hash, str) else bytes(block_hash)
-        hasher.update(len(hash_bytes).to_bytes(_GROUPED_BLOCK_HASH_LENGTH_PREFIX_BYTES, "big"))
-        hasher.update(hash_bytes)
-    return hasher.digest()
 
 
 class TestKeyMetadata(unittest.TestCase):
@@ -88,6 +73,15 @@ class TestPoolKey(unittest.TestCase):
         self.assertIn("@pp_rank:0", s)
         self.assertIn("hash1", s)
 
+    def test_pp_ranks_use_distinct_keys(self):
+        other_pp_meta = KeyMetadata("llama", 1, 2, 3, 1)
+        pp0_key = PoolKey(self.meta, "hash1")
+        pp1_key = PoolKey(other_pp_meta, "hash1")
+
+        self.assertNotEqual(pp0_key.to_string(), pp1_key.to_string())
+        self.assertIn("@pp_rank:0", pp0_key.to_string())
+        self.assertIn("@pp_rank:1", pp1_key.to_string())
+
     def test_split_layers(self):
         k = PoolKey(self.meta, "hash1")
         layers = k.split_layers(3)
@@ -118,7 +112,7 @@ class TestChunkedTokenDatabase(unittest.TestCase):
     def setUp(self):
         self.meta = KeyMetadata("llama", 0, 0, 0, 0)
         self.db = ChunkedTokenDatabase([self.meta], block_size=[16], partitions=None)
-        self.db.set_group_buffers({0: [1000, 2000]}, {0: [160, 320]})
+        self.db.set_group_buffers({0: [1000, 2000]}, {0: [160, 320]}, group_num_layers={0: 1})
 
     def test_make_key_by_hash(self):
         key = self.db._make_key_by_hash("abc")
@@ -150,39 +144,106 @@ class TestChunkedTokenDatabase(unittest.TestCase):
         self.assertEqual(len(result), 2)
         self.assertEqual(result[0][0], 16)
 
+    def test_process_tokens_with_tail_clipped_block_ids_maps_tail_chunks(self):
+        db = ChunkedTokenDatabase([self.meta], block_size=[128], partitions=None)
+        hashes = [bytes([idx % 251]) * 32 for idx in range(128)]
+
+        result = list(
+            db.process_token_key_strings_with_block_ids(
+                128 * 128,
+                hashes,
+                [1000, 1001, 1002, 1003],
+            )
+        )
+
+        self.assertEqual(
+            [start for start, _, _, _, _ in result],
+            [124 * 128, 125 * 128, 126 * 128, 127 * 128],
+        )
+        self.assertEqual(
+            [block_id for _, _, _, _, block_id in result],
+            [1000, 1001, 1002, 1003],
+        )
+
     def test_process_tokens_token_len_shorter_than_all_blocks(self):
         hashes = ["a", "b", "c", "d"]
         # token_len=32 means only first 2 blocks valid
         result = list(self.db.process_tokens(32, hashes))
         self.assertEqual(len(result), 2)
 
-    def test_process_tokens_rehashes_grouped_hashes(self):
+    def test_process_tokens_selects_terminal_group_hash(self):
         db = ChunkedTokenDatabase([self.meta], block_size=[16], partitions=None, hash_block_size=8)
         result = list(db.process_tokens(32, ["a", "b", "c", "d"]))
         self.assertEqual(len(result), 2)
-        self.assertEqual(result[0][2].chunk_hash, _expected_grouped_hash("a", "b").hex())
-        self.assertEqual(len(result[0][2].chunk_hash), 64)
+        self.assertEqual(result[0][2].chunk_hash, "b")
 
-    def test_get_block_hashes_rehashes_grouped_str_hashes(self):
+    def test_key_strings_match_pool_keys(self):
+        hashes = ["aaa", "bbb", "ccc"]
+        pool_keys = list(self.db.process_tokens(40, hashes))
+        self.assertEqual(
+            list(self.db.process_token_key_strings(40, hashes)),
+            [
+                (start, end, key.to_string(), hash_val)
+                for (start, end, key), hash_val in zip(pool_keys, hashes, strict=True)
+            ],
+        )
+
+        block_ids = [5, 6]
+        self.assertEqual(
+            list(self.db.process_token_key_strings_with_block_ids(32, hashes, block_ids)),
+            [
+                (start, end, key.to_string(), hash_val, block_id)
+                for (start, end, key), hash_val, block_id in zip(pool_keys[:2], hashes[:2], block_ids, strict=True)
+            ],
+        )
+
+    def test_direct_keys_preserve_multigroup_layerwise_key_semantics(self):
+        group_metadata = [
+            KeyMetadata("llama", 0, 0, 0, 0),
+            KeyMetadata("llama", 1, 0, 0, 0),
+        ]
+        db = ChunkedTokenDatabase(group_metadata, block_size=[16, 32], partitions=None, hash_block_size=16)
+        db.set_group_buffers(
+            {0: [1000], 1: [2000]},
+            {0: [160], 1: [320]},
+            group_cache_families={0: "c1", 1: "c2"},
+            group_num_layers={0: 2, 1: 2},
+        )
+        hashes = ["a", "b", "c", "d"]
+
+        pool_key_result = list(db.process_tokens(64, hashes, kv_cache_group_id=1))
+        direct_key_result = list(db.process_token_key_strings(64, hashes, kv_cache_group_id=1))
+
+        self.assertEqual(len(pool_key_result), 1)
+        self.assertEqual(
+            direct_key_result[0][:3],
+            (pool_key_result[0][0], pool_key_result[0][1], pool_key_result[0][2].to_string()),
+        )
+        layer_key = pool_key_result[0][2].split_layers(2)[1]
+        self.assertIn("@group:1@cache_role:kv@cache_family:c2@layer_id:1", layer_key.to_string())
+
+    def test_key_strings_pre_shard_after_filtering(self):
+        hashes = ["a", "b", "c", "d"]
+        store_mask = [True, False, True, True]
+        result = list(
+            self.db.process_token_key_strings_with_block_ids(
+                64,
+                hashes,
+                [10, 11, 12, 13],
+                chunk_filter=lambda start: store_mask[start // 16],
+                shard_rank=1,
+                shard_size=2,
+            )
+        )
+        self.assertEqual([(start, end, block_id) for start, end, _, _, block_id in result], [(32, 48, 12)])
+
+    def test_get_block_hashes_selects_terminal_str_hashes(self):
         result = get_block_hashes(["a", "b", "c", "d"], group_block_size=32, hash_block_size=16)
-        self.assertEqual(
-            result,
-            [
-                _expected_grouped_hash("a", "b"),
-                _expected_grouped_hash("c", "d"),
-            ],
-        )
+        self.assertEqual(list(result), ["b", "d"])
 
-    def test_get_block_hashes_rehashes_grouped_bytes_hashes(self):
+    def test_get_block_hashes_selects_terminal_byte_hashes(self):
         result = get_block_hashes([b"a", b"b", b"c", b"d"], group_block_size=32, hash_block_size=16)
-        self.assertEqual(
-            result,
-            [
-                _expected_grouped_hash(b"a", b"b"),
-                _expected_grouped_hash(b"c", b"d"),
-            ],
-        )
-        self.assertEqual(len(result[0]), 32)
+        self.assertEqual(list(result), [b"b", b"d"])
 
     def test_prepare_value(self):
         addr, size, block_id = self.db.prepare_value(0, 16, [5, 6, 7])
@@ -198,11 +259,19 @@ class TestChunkedTokenDatabase(unittest.TestCase):
         self.assertEqual(size[0], 80)  # 160/16*8
         self.assertEqual(size[1], 160)  # 320/16*8
 
+    def test_prepare_value_uses_block_id_override(self):
+        addr, size, block_id = self.db.prepare_value(64, 80, [5], block_id=99)
+        self.assertEqual(block_id, 99)
+        self.assertEqual(addr[0], 1000 + 99 * 160)
+        self.assertEqual(addr[1], 2000 + 99 * 320)
+        self.assertEqual(size[0], 160)
+        self.assertEqual(size[1], 320)
+
     def test_prepare_value_layer(self):
         addr, size, block_id = self.db.prepare_value_layer(0, 16, [5, 6], layer_id=0)
         self.assertEqual(block_id, 5)
         self.assertEqual(len(addr), 2)
-        # layer_id=0 => kv_caches_base_addr[0*2 + i] per cache i
+        # layer_id=0, entries_per_layers=2 => group_addrs[0] and group_addrs[1]
         self.assertEqual(addr[0], 1000 + 5 * 160)
         self.assertEqual(addr[1], 2000 + 5 * 320)
 
@@ -282,6 +351,74 @@ class TestRequestTracker(unittest.TestCase):
         tracker = RequestTracker(req_id="r1", token_len=16, allocated_block_ids=[1])
         with self.assertRaises(ValueError):
             tracker.update("invalid")  # type: ignore[arg-type]
+
+    def test_update_mamba_with_tuple(self):
+        tracker = RequestTracker(
+            req_id="r1", token_len=16, allocated_block_ids_by_group=[[1], [2], [3], [4]], block_sizes=[16] * 4
+        )
+        tracker.update(([5, 6], [0, 7], [0, 8], [0, 9]))
+        self.assertEqual(tracker.allocated_block_ids_by_group[0], [1, 5, 6])
+        self.assertEqual(tracker.allocated_block_ids_by_group[1], [2, 0, 7])
+        self.assertEqual(tracker.allocated_block_ids_by_group[2], [3, 0, 8])
+        self.assertEqual(tracker.allocated_block_ids_by_group[3], [4, 0, 9])
+
+    def test_update_mamba_mtp_with_tuple_chunk2(self):
+        tracker = RequestTracker(
+            req_id="r1",
+            token_len=32,
+            allocated_block_ids_by_group=[
+                [1, 2],
+                [0, 3, 4, 5, 6],
+                [0, 7, 8, 9, 10],
+                [0, 11, 12, 13, 14],
+            ],
+            mamba_group_ids=[1, 2, 3],
+            num_speculative_blocks=3,
+            block_sizes=[16] * 4,
+        )
+
+        tracker.update(([15, 16], [4, 17], [8, 18], [12, 19]), 32)
+        self.assertEqual(tracker.allocated_block_ids_by_group[0], [1, 2, 15, 16])
+        self.assertEqual(tracker.allocated_block_ids_by_group[1], [0, 3, 0, 5, 6, 4, 17])
+        self.assertEqual(tracker.allocated_block_ids_by_group[2], [0, 7, 0, 9, 10, 8, 18])
+        self.assertEqual(tracker.allocated_block_ids_by_group[3], [0, 11, 0, 13, 14, 12, 19])
+
+    def test_update_mamba_mtp_with_tuple_chunk8(self):
+        tracker = RequestTracker(
+            req_id="r1",
+            token_len=128,
+            allocated_block_ids_by_group=[
+                [1, 2, 3, 4, 5, 6, 7, 8],
+                [0, 0, 0, 0, 0, 0, 0, 9, 10, 11, 12],
+                [0, 0, 0, 0, 0, 0, 0, 13, 14, 15, 16],
+                [0, 0, 0, 0, 0, 0, 0, 17, 18, 19, 20],
+            ],
+            mamba_group_ids=[1, 2, 3],
+            num_speculative_blocks=3,
+            block_sizes=[16] * 4,
+        )
+
+        tracker.update(
+            (
+                [21, 22, 23, 24, 25, 26, 27, 28],
+                [0, 0, 0, 0, 10, 11, 12, 29],
+                [0, 0, 0, 0, 14, 15, 16, 30],
+                [0, 0, 0, 0, 18, 19, 20, 31],
+            ),
+            128,
+        )
+        self.assertEqual(
+            tracker.allocated_block_ids_by_group[0], [1, 2, 3, 4, 5, 6, 7, 8, 21, 22, 23, 24, 25, 26, 27, 28]
+        )
+        self.assertEqual(
+            tracker.allocated_block_ids_by_group[1], [0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 10, 11, 12, 29]
+        )
+        self.assertEqual(
+            tracker.allocated_block_ids_by_group[2], [0, 0, 0, 0, 0, 0, 0, 13, 0, 0, 0, 0, 0, 0, 0, 14, 15, 16, 30]
+        )
+        self.assertEqual(
+            tracker.allocated_block_ids_by_group[3], [0, 0, 0, 0, 0, 0, 0, 17, 0, 0, 0, 0, 0, 0, 0, 18, 19, 20, 31]
+        )
 
 
 class TestReqMeta(unittest.TestCase):
