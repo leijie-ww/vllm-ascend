@@ -196,11 +196,11 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             a = a.contiguous()
         else:
             if not self.gqa_interleaved_layout:
-                mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-                num_tokens = mixed_qkvz.size(0)
+                qkvz_weight = self.in_proj_qkvz.weight
                 qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
-                z_size = self.value_dim // self.tp_size
-                mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
+                mixed_qkv = torch.nn.functional.linear(hidden_states, qkvz_weight[:qkv_size])
+                z = torch.nn.functional.linear(hidden_states, qkvz_weight[qkv_size:])
+                num_tokens = mixed_qkv.size(0)
                 z = z.reshape(z.size(0), -1, self.head_v_dim)
                 ba, _ = self.in_proj_ba(hidden_states)
                 b, a = self._split_ba_for_tp(ba)
