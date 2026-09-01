@@ -29,6 +29,7 @@ from vllm_ascend._310p.ops.fla.fused_gdn_gating import fused_gdn_gating_pytorch
 from vllm_ascend._310p.ops.fla.l2norm import l2norm_310p
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
+from vllm_ascend.ops.gdn import _get_packed_conv_weights
 from vllm_ascend.utils import enable_sp
 
 
@@ -235,7 +236,7 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
             a = a[:num_actual_tokens]
 
         # 1. Convolution sequence transformation
-        conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2)).transpose(0, 1)
+        conv_weights = _get_packed_conv_weights(self)
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 mixed_qkv_spec = mixed_qkv
