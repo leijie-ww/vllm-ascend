@@ -8,6 +8,7 @@ from inspect import signature
 
 from vllm.config import parallel as _parallel_config
 from vllm.distributed.eplb import eplb_communicator as _eplb_communicator
+from vllm.distributed.eplb import rebalance_execute as _rebalance_execute
 from vllm.distributed.eplb import eplb_state as _eplb_state
 from vllm.logger import logger
 
@@ -15,6 +16,11 @@ from vllm_ascend.distributed.eplb.communicator import AscendGlooEplbCommunicator
 from vllm_ascend.distributed.eplb.state import (
     ASYNC_EPLB_CYCLE_COMMITTED_LOG,
     refresh_model_routing_tables,
+)
+from vllm_ascend.eplb.adaptor.vllm_adaptor import (
+    _copy_expert_tensor,
+    _empty_like_expert_tensor,
+    prepare_expert_tensor_for_send,
 )
 
 _PATCH_MARKER = "_vllm_ascend_eplb_patch"
@@ -133,6 +139,17 @@ def _patch_async_move_to_workspace() -> None:
         _eplb_state._move_to_workspace = _wrap_move_to_workspace(original_move)
 
 
+def _patch_rebalance_tensor_hooks() -> None:
+    """Teach upstream EPLB how to move Ascend internal-format tensors."""
+    _rebalance_execute.set_eplb_tensor_hooks(
+        empty_like=_empty_like_expert_tensor,
+        copy_tensor=_copy_expert_tensor,
+        prepare_send=prepare_expert_tensor_for_send,
+    )
+    _eplb_communicator.set_eplb_tensor_copy_hook(_copy_expert_tensor)
+
+
 _patch_parallel_config()
 _patch_communicator_factory()
 _patch_async_move_to_workspace()
+_patch_rebalance_tensor_hooks()

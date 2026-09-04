@@ -190,10 +190,10 @@ class TestAscendW8A8MXFP8MoEMethod(TestBase):
         self.assertTrue(hasattr(layer, "_mxfp8_original_shapes"))
         self.assertIn("w13_weight", layer._mxfp8_original_shapes)
         self.assertEqual(layer.w13_weight.shape, (original_shape[0], original_shape[2], original_shape[1]))
-        self.assertFalse(layer.w13_weight.data.is_contiguous())
-        self.assertFalse(layer.w2_weight.data.is_contiguous())
-        self.assertFalse(layer.w13_weight_scale.data.is_contiguous())
-        self.assertFalse(layer.w2_weight_scale.data.is_contiguous())
+        self.assertTrue(layer.w13_weight.data.is_contiguous())
+        self.assertTrue(layer.w2_weight.data.is_contiguous())
+        self.assertTrue(layer.w13_weight_scale.data.is_contiguous())
+        self.assertTrue(layer.w2_weight_scale.data.is_contiguous())
 
         weight_views = self.scheme.get_eplb_weight_views(layer)
         self.assertTrue(self.scheme.supports_eplb)
@@ -202,9 +202,24 @@ class TestAscendW8A8MXFP8MoEMethod(TestBase):
             [layer.w13_weight, layer.w2_weight, layer.w13_weight_scale, layer.w2_weight_scale],
             weight_views,
         ):
+            # EPLB must receive the execution tensor itself. A contiguous
+            # copy would make weight migration invisible to the MoE kernel.
+            self.assertIs(weight_view, source)
             self.assertTrue(weight_view.is_contiguous())
             self.assertEqual(weight_view.shape[0], self.num_experts)
             self.assertEqual(weight_view.untyped_storage().data_ptr(), source.untyped_storage().data_ptr())
+
+    def test_eplb_weight_views_are_flattenable_without_copy(self):
+        layer = create_mxfp_moe_layer(
+            num_experts=self.num_experts, hidden_size=self.hidden_size, intermediate_size=self.intermediate_size
+        )
+        self.scheme.process_weights_after_loading(layer)
+
+        # Exercise the same flattening contract used by AscendRoutedExperts.
+        for weight in self.scheme.get_eplb_weight_views(layer):
+            flattened = weight.view(self.num_experts, -1)
+            self.assertEqual(flattened.shape[0], self.num_experts)
+            self.assertEqual(flattened.untyped_storage().data_ptr(), weight.untyped_storage().data_ptr())
 
     def test_restore_weights_for_rl_loading(self):
         layer = create_mxfp_moe_layer(

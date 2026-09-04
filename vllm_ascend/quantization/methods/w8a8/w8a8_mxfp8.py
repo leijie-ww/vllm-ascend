@@ -306,11 +306,14 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
 
     @staticmethod
     def get_eplb_weight_views(layer: torch.nn.Module) -> list[torch.Tensor]:
+        # process_weights_after_loading() stores weights in EPLB expert order
+        # and makes them contiguous before casting to FRACTAL_NZ.  Return the
+        # actual execution tensors so EPLB updates mutate the captured weights.
         return [
-            layer.w13_weight.transpose(1, 2),
-            layer.w2_weight.transpose(1, 2),
-            layer.w13_weight_scale.transpose(1, 2),
-            layer.w2_weight_scale.transpose(1, 2),
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
         ]
 
     def process_weights_after_loading(self, layer):
@@ -348,8 +351,10 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
         layer.w2_weight_scale.data = layer.w2_weight_scale.data.reshape(g_num, n_size, k_size // 2, 2)
         layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
         layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
-        layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
-        layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
+        if layer.w13_weight.device.type == "npu":
+            layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
+        if layer.w2_weight.device.type == "npu":
+            layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
         layer.w13_weight_scale.data = layer.w13_weight_scale.data.transpose(1, 2).contiguous()
         layer.w2_weight_scale.data = layer.w2_weight_scale.data.transpose(1, 2).contiguous()
 
@@ -392,7 +397,8 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
             """Helper to restore a single MoE weight and its scale using safe memory copies."""
             # --- 1. Restore Weight ---
             weight_tensor = getattr(layer, weight_key)
-            weight_tensor.data = torch_npu.npu_format_cast(weight_tensor.data, ACL_FORMAT_FRACTAL_ND)
+            if weight_tensor.device.type == "npu":
+                weight_tensor.data = torch_npu.npu_format_cast(weight_tensor.data, ACL_FORMAT_FRACTAL_ND)
             target_weight = weight_tensor.data.transpose(1, 2).contiguous()
             weight_tensor.data = weight_tensor.data.transpose(1, 2)
             weight_tensor.data.copy_(target_weight)

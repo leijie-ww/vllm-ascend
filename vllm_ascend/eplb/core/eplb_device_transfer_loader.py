@@ -21,6 +21,7 @@ from vllm.logger import logger
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_ascend.distributed.parallel_state import get_dynamic_eplb_group
+from vllm_ascend.eplb.adaptor.vllm_adaptor import prepare_expert_tensor_for_send
 
 
 class ExpertWeightUpdateState(Enum):
@@ -37,6 +38,7 @@ class D2DExpertWeightLoader:
         self.layer_id = -1  # layer id to be updated
         self.state = ExpertWeightUpdateState.WAITING
         self.recv_expert_list = []
+        self.send_staging_tensors = []
         self.num_layers = 0
         self.comm_group = get_dynamic_eplb_group()
 
@@ -55,13 +57,17 @@ class D2DExpertWeightLoader:
 
         self.layer_id = layer_id
         self.comm_op_list = []
+        self.send_staging_tensors = []
         for send_info in expert_send_info:
             dst_rank, global_expert_id_to_send = send_info
             local_expert_id = self.eplb_adaptor.expert_map_per_layer_cpu[layer_id][global_expert_id_to_send].item()
             for src_tensor in self.eplb_adaptor.expert_param_per_layer[layer_id][local_expert_id]:
+                send_tensor = prepare_expert_tensor_for_send(src_tensor)
+                if send_tensor is not src_tensor:
+                    self.send_staging_tensors.append(send_tensor)
                 self.comm_op_list.append(
                     dist.P2POp(
-                        dist.isend, src_tensor, self.comm_group.ranks[dst_rank], group=self.comm_group.device_group
+                        dist.isend, send_tensor, self.comm_group.ranks[dst_rank], group=self.comm_group.device_group
                     )
                 )
 
@@ -107,6 +113,7 @@ class D2DExpertWeightLoader:
 
         if self.comm_op_list is not None:
             self.comm_op_list = None
+        self.send_staging_tensors = []
 
         # update expert_map
         self.eplb_adaptor.do_update_expert_map(self.layer_id, self.updated_expert_map)

@@ -21,10 +21,12 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+import torch_npu
 from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.quantization.quant_type import QuantType
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ
 
 EPLB_EXPERT_WEIGHT_NAMES = {
     (QuantType.NONE, False): ("w13_weight", "w2_weight"),
@@ -64,6 +66,139 @@ EPLB_EXPERT_WEIGHT_NAMES = {
     (QuantType.W8A8MXFP, False): ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"),
     (QuantType.W8A8MXFP, True): ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"),
 }
+
+
+def _is_fractal_nz_tensor(tensor: torch.Tensor) -> bool:
+    """Return whether *tensor* carries Ascend's internal FRACTAL_NZ layout."""
+    if tensor.device.type != "npu":
+        return False
+    try:
+        return int(torch_npu.get_npu_format(tensor)) == ACL_FORMAT_FRACTAL_NZ
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _has_fractal_nz_storage(tensor: torch.Tensor) -> bool:
+    """Return whether a tensor or its owning expert parameter uses NZ storage."""
+    if _is_fractal_nz_tensor(tensor):
+        return True
+    parent, _ = _resolve_expert_parent(tensor)
+    return parent is not None and _is_fractal_nz_tensor(parent)
+
+
+def _empty_like_expert_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Allocate an EPLB receive buffer with the source tensor's internal format.
+
+    ``torch.empty_like`` drops the NZ metadata on current torch_npu releases.
+    HCCL receives the physical NZ tile stream, so an ND buffer is not a valid
+    destination for an NZ expert slice.
+    """
+    if not _has_fractal_nz_storage(tensor):
+        return torch.empty_like(tensor)
+    try:
+        return torch_npu.empty_with_format(
+            tuple(tensor.shape),
+            dtype=tensor.dtype,
+            layout=tensor.layout,
+            device=tensor.device,
+            pin_memory=False,
+            acl_format=ACL_FORMAT_FRACTAL_NZ,
+        )
+    except (AttributeError, RuntimeError, TypeError):
+        # Keep compatibility with older torch_npu builds that do not expose
+        # empty_with_format as a Python API.
+        return torch_npu.npu_format_cast(torch.empty_like(tensor), ACL_FORMAT_FRACTAL_NZ)
+
+
+def _copy_expert_tensor(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """Copy an EPLB expert row while preserving internal NPU formats."""
+    if dst.device.type == "npu" and src.device.type != "npu":
+        # Gloo EPLB receives into CPU staging tensors before copying back to
+        # the NPU execution buffer.  Convert the source once so the NZ-aware
+        # path below can use the same device-side copy primitives.
+        src = src.to(device=dst.device)
+    if dst.device.type == src.device.type == "npu":
+        copy_memory = getattr(torch_npu, "copy_memory_", None)
+        if copy_memory is not None:
+            try:
+                copy_memory(dst, src)
+                return
+            except RuntimeError:
+                # If an internal-format copy is attempted, do not silently
+                # fall back to aten.copy_, which is unsupported for NZ on some
+                # torch_npu versions.
+                if _has_fractal_nz_storage(dst) or _has_fractal_nz_storage(src):
+                    dst_parent, dst_index = _resolve_expert_parent(dst)
+                    src_parent, src_index = _resolve_expert_parent(src)
+                    if dst_parent is None:
+                        raise
+
+                    # copy_memory_ requires storage_offset == 0.  An expert
+                    # slice other than expert 0 therefore has to be rebuilt
+                    # in an offset-0 ND staging tensor and copied back as one
+                    # NZ tensor.  The parent parameter's storage is retained,
+                    # so captured execution graphs continue to see the update.
+                    parent_nd = torch_npu.npu_format_cast(dst_parent, ACL_FORMAT_FRACTAL_ND)
+                    dst_row_shape = parent_nd.shape[1:]
+                    if src_parent is None:
+                        src_row = src
+                    elif src_parent is src and src.numel() == parent_nd[dst_index].numel():
+                        src_row = torch_npu.npu_format_cast(src, ACL_FORMAT_FRACTAL_ND)
+                    else:
+                        src_parent_nd = torch_npu.npu_format_cast(src_parent, ACL_FORMAT_FRACTAL_ND)
+                        src_row = src_parent_nd[src_index]
+                    # NPU does not support copy_, cat, or index updates on
+                    # rank-reduced views of an internal-format tensor. Stage
+                    # the semantic ND parent on CPU, update one expert row,
+                    # then cast the complete parent back to NZ and commit it
+                    # through the original offset-0 storage.
+                    updated_cpu = parent_nd.cpu()
+                    if src_row.device.type == "npu":
+                        if _has_fractal_nz_storage(src_row):
+                            src_row = torch_npu.npu_format_cast(src_row, ACL_FORMAT_FRACTAL_ND)
+                        src_row = src_row.cpu()
+                    updated_cpu[dst_index].copy_(src_row.reshape(dst_row_shape).contiguous())
+                    updated_nd = updated_cpu.to(device=dst.device)
+                    parent_nz = torch_npu.npu_format_cast(updated_nd, ACL_FORMAT_FRACTAL_NZ)
+                    copy_memory(dst_parent, parent_nz)
+                    return
+    dst.copy_(src)
+
+
+def prepare_expert_tensor_for_send(tensor: torch.Tensor) -> torch.Tensor:
+    """Materialize an offset-0 send tensor when an expert is a view of NZ storage."""
+    if not _has_fractal_nz_storage(tensor):
+        return tensor
+    if tensor.storage_offset() == 0:
+        return tensor
+
+    parent, expert_index = _resolve_expert_parent(tensor)
+    if parent is None:
+        if tensor.storage_offset() != 0:
+            raise ValueError("An EPLB FRACTAL_NZ send tensor must have storage_offset == 0.")
+        return tensor
+    parent_nd = torch_npu.npu_format_cast(parent, ACL_FORMAT_FRACTAL_ND)
+    expert_nd = parent_nd[expert_index].clone()
+    return torch_npu.npu_format_cast(expert_nd, ACL_FORMAT_FRACTAL_NZ)
+
+
+def _resolve_expert_parent(tensor: torch.Tensor) -> tuple[torch.Tensor | None, int]:
+    """Find the owning tensor and expert row for a view of an expert tensor."""
+    # Start at the first base tensor.  An expert slice is itself usually a
+    # rank-reduced view (for example [K, N]), so treating the slice as its own
+    # E-dimensional parent would resolve every update to row zero.
+    current = getattr(tensor, "_base", None)
+    tensor_offset = tensor.storage_offset()
+    while current is not None:
+        if current.ndim > tensor.ndim and current.shape[0] > 0:
+            stride = current.stride(0)
+            offset = tensor_offset - current.storage_offset()
+            if stride > 0 and offset >= 0:
+                expert_index, remainder = divmod(offset, stride)
+                if remainder == 0 and expert_index < current.shape[0]:
+                    return current, expert_index
+        current = getattr(current, "_base", None)
+    return None, -1
 
 
 class VllmEplbAdaptor:
@@ -129,7 +264,7 @@ class VllmEplbAdaptor:
             self.buffer_tensor_list[expert_weight_key] = [[] for _ in range(num_buffer_tensor)]
             for buffer_id in range(num_buffer_tensor):
                 for expert_tensor in expert_tensors:
-                    buffer_tensor = torch.empty_like(expert_tensor)
+                    buffer_tensor = _empty_like_expert_tensor(expert_tensor)
                     self.buffer_tensor_list[expert_weight_key][buffer_id].append(buffer_tensor)
 
     def init_expert_param_per_layer(self):
@@ -205,7 +340,7 @@ class VllmEplbAdaptor:
             self.expert_param_per_layer[layer_id][local_expert_to_replace],
             self.buffer_tensor_list[expert_weight_key][buffer_tensor_id],
         ):
-            expert_tensor.copy_(buffer_tensor)
+            _copy_expert_tensor(expert_tensor, buffer_tensor)
             logger.debug("Expert tensor shape is :%s", expert_tensor.shape)
 
     def do_update_log2phy_map(self, layer_id, updated_log2phy_map):

@@ -63,6 +63,33 @@ def test_generate_task_uses_layer_weight_key_buffer(mock_adaptor):
     assert mock_p2p.call_args_list[1].args[1] is mock_adaptor.buffer_tensor_list["weight_key"][0][1]
 
 
+def test_generate_task_retains_send_staging_until_transfer_finishes(mock_adaptor):
+    comm_group = MagicMock()
+    comm_group.ranks = {1: 11}
+    comm_group.device_group = object()
+    staged_tensor = torch.tensor([9.0])
+    with patch("vllm_ascend.eplb.core.eplb_device_transfer_loader.get_dynamic_eplb_group", return_value=comm_group):
+        loader_obj = loader.D2DExpertWeightLoader()
+    loader_obj.set_adator(mock_adaptor)
+
+    with patch(
+        "vllm_ascend.eplb.core.eplb_device_transfer_loader.prepare_expert_tensor_for_send",
+        return_value=staged_tensor,
+    ), patch(
+        "torch.distributed.P2POp",
+        side_effect=lambda op, tensor, rank, group=None: (op, tensor, rank, group),
+    ) as mock_p2p:
+        loader_obj.generate_expert_d2d_transfer_task([(1, 10)], [], {}, 0)
+
+    assert loader_obj.send_staging_tensors == [staged_tensor]
+    assert mock_p2p.call_args.args[1] is staged_tensor
+
+    with patch("torch.distributed.batch_isend_irecv", return_value=[]):
+        loader_obj.asyn_expert_weight_transfer([])
+    loader_obj.update_expert_map_and_weight([])
+    assert loader_obj.send_staging_tensors == []
+
+
 def test_asyn_transfer_and_update(mock_adaptor):
     with patch("vllm_ascend.eplb.core.eplb_device_transfer_loader.get_dynamic_eplb_group", return_value=None):
         loader_obj = loader.D2DExpertWeightLoader()

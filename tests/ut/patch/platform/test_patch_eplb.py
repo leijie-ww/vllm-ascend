@@ -78,6 +78,22 @@ def test_parallel_config_platform_patch_is_idempotent():
     assert parallel_module.current_platform is proxy
 
 
+def test_rebalance_tensor_hooks_are_registered(monkeypatch):
+    register = MagicMock()
+    register_copy = MagicMock()
+    monkeypatch.setattr(patch_eplb._rebalance_execute, "set_eplb_tensor_hooks", register)
+    monkeypatch.setattr(patch_eplb._eplb_communicator, "set_eplb_tensor_copy_hook", register_copy)
+
+    patch_eplb._patch_rebalance_tensor_hooks()
+
+    register.assert_called_once_with(
+        empty_like=patch_eplb._empty_like_expert_tensor,
+        copy_tensor=patch_eplb._copy_expert_tensor,
+        prepare_send=patch_eplb.prepare_expert_tensor_for_send,
+    )
+    register_copy.assert_called_once_with(patch_eplb._copy_expert_tensor)
+
+
 def test_communicator_factory_creates_ascend_gloo_communicator(monkeypatch):
     communicator = object()
     gloo_cls = MagicMock(return_value=communicator)
