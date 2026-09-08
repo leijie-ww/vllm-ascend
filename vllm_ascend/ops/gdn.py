@@ -15,13 +15,17 @@
 # limitations under the License.
 #
 
+from functools import wraps
+
 import torch
 import torch_npu
 from einops import rearrange
+from torch import nn
 from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
+from vllm.model_executor.utils import replace_parameter
 from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
 from vllm.triton_utils import triton
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata  # type: ignore
@@ -43,25 +47,76 @@ from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 _PACKED_CONV_WEIGHT_NAME = "ascend_conv1d_weight"
 
 
-def _get_packed_conv_weights(layer: "AscendGatedDeltaNetAttention") -> torch.Tensor:
-    """Cached ``[W, D]`` transposed conv1d weight, materialized once.
+def _get_base_conv1d(layer: nn.Module) -> nn.Module:
+    """Return the module that owns the actual convolution weight.
 
-    Mirrors ``kimi_kda._pack_conv_weights``: ``npu_causal_conv1d_custom`` wants
-    the ``[W, D]`` layout while ``conv1d.weight`` is ``[D, 1, W]``, so the
-    contiguous transpose is packed once and cached. Cached as a plain attribute
-    (not a registered parameter) because this layer is patched onto
-    ``QwenGatedDeltaNetAttention`` via method copy, so ``__init__`` does not run
-    here and the weight is packed lazily on first use.
+    LoRA replaces ``conv1d`` with a wrapper while keeping the original linear
+    layer in ``base_layer``. Derived state must live on that base layer so the
+    layerwise reloader restores source and packed storages together.
     """
-    cached = getattr(layer, _PACKED_CONV_WEIGHT_NAME, None)
-    if cached is not None:
-        return cached
-    w = layer.conv1d.weight
-    if w.is_meta:
-        return w.view(w.size(0), w.size(2)).transpose(0, 1)
-    packed = w.view(w.size(0), w.size(2)).transpose(0, 1).to(device=w.device, dtype=w.dtype).contiguous()
-    setattr(layer, _PACKED_CONV_WEIGHT_NAME, packed)
-    return packed
+    conv1d = layer.conv1d
+    return getattr(conv1d, "base_layer", conv1d)
+
+
+@torch.no_grad()
+def _pack_conv_weights(conv1d: nn.Module) -> None:
+    """Rebuild the kernel-layout convolution parameter in place."""
+    source_weight = conv1d.weight
+    if source_weight.is_meta:
+        return
+
+    packed_param = conv1d.get_parameter(_PACKED_CONV_WEIGHT_NAME)
+    packed_weight = (
+        source_weight.view(source_weight.size(0), source_weight.size(2))
+        .transpose(0, 1)
+        .to(device=packed_param.device, dtype=packed_param.dtype)
+        .contiguous()
+    )
+    replace_parameter(
+        conv1d,
+        _PACKED_CONV_WEIGHT_NAME,
+        packed_weight,
+        prefer_copy=True,
+    )
+
+
+def initialize_packed_conv_weight(layer: nn.Module) -> None:
+    """Register and connect GDN's derived convolution weight to post-load."""
+    conv1d = _get_base_conv1d(layer)
+    source_weight = conv1d.weight
+    if _PACKED_CONV_WEIGHT_NAME not in conv1d._parameters:
+        conv1d.register_parameter(
+            _PACKED_CONV_WEIGHT_NAME,
+            nn.Parameter(
+                torch.empty(
+                    source_weight.size(2),
+                    source_weight.size(0),
+                    dtype=layer.model_config.dtype,
+                    device=source_weight.device,
+                ),
+                requires_grad=False,
+            ),
+        )
+
+    quant_method = getattr(conv1d, "quant_method", None)
+    process_weights_after_loading = getattr(
+        quant_method, "process_weights_after_loading", None
+    )
+    if process_weights_after_loading is None:
+        return
+
+    @wraps(process_weights_after_loading)
+    def process_and_pack(*args, **kwargs):
+        result = process_weights_after_loading(*args, **kwargs)
+        _pack_conv_weights(conv1d)
+        return result
+
+    quant_method.process_weights_after_loading = process_and_pack
+
+
+def _get_packed_conv_weights(layer: nn.Module) -> torch.Tensor:
+    """Return the registered kernel-layout convolution parameter."""
+    return _get_base_conv1d(layer).get_parameter(_PACKED_CONV_WEIGHT_NAME)
 
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):

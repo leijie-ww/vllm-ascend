@@ -169,7 +169,7 @@ def test_start_weight_update():
     with patch("vllm.model_executor.model_loader.reload.initialize_layerwise_reload") as mock_init:
         engine.start_weight_update()
 
-    mock_init.assert_not_called()
+    mock_init.assert_called_once_with(engine.model)
 
 
 def test_finish_weight_update():
@@ -180,4 +180,4 @@ def test_finish_weight_update():
     with patch("vllm.model_executor.model_loader.reload.finalize_layerwise_reload") as mock_finalize:
         engine.finish_weight_update()
 
-    mock_finalize.assert_not_called()
+    mock_finalize.assert_called_once_with(engine.model, engine.model_config)
