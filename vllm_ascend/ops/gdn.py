@@ -43,6 +43,24 @@ from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 from vllm_ascend.utils import _is_standard_nd_weight
 
 
+def precompute_gdn_weight_split(layer: "AscendGatedDeltaNetAttention") -> None:
+    """Precompute ``layer._use_weight_split`` from the real loaded NPU weight.
+
+    Must run eagerly after weights are loaded and before torch.compile traces
+    ``AscendGatedDeltaNetAttention.forward``. The NPU storage format is a static
+    property of the weight, but ``torch_npu.get_npu_format`` cannot run under
+    compile tracing (fake tensors raise ``torch._dynamo.exc.Unsupported``), so
+    the value is baked in here as a plain Python bool that dynamo specializes as
+    a constant, letting ``forward`` take the correct branch at runtime.
+    """
+    layer._use_weight_split = (
+        isinstance(
+            getattr(layer.in_proj_qkvz, "quant_method", None), UnquantizedLinearMethod
+        )
+        and _is_standard_nd_weight(layer.in_proj_qkvz.weight)
+    )
+
+
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
     # Cached fused-op availability probe result, shared across all layers so the
     # smoke call runs at most once per process.
@@ -209,10 +227,21 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 # quant_config does not identify this per-layer state. Direct
                 # slicing is safe only for a standard ND weight; packed NPU
                 # layouts must use the linear module's normal forward path.
-                use_weight_split = (
-                    isinstance(getattr(self.in_proj_qkvz, "quant_method", None), UnquantizedLinearMethod)
-                    and _is_standard_nd_weight(self.in_proj_qkvz.weight)
-                )
+                # ``_use_weight_split`` is precomputed on the real NPU weight at
+                # load time (precompute_gdn_weight_split); the NPU storage format
+                # cannot be queried under torch.compile tracing. Only the eager
+                # path falls back to a live query; under tracing without a
+                # precomputed value, the safe normal projection path is used.
+                use_weight_split = getattr(self, "_use_weight_split", None)
+                if use_weight_split is None:
+                    if torch.compiler.is_compiling():
+                        use_weight_split = False
+                    else:
+                        use_weight_split = (
+                            isinstance(getattr(self.in_proj_qkvz, "quant_method", None), UnquantizedLinearMethod)
+                            and _is_standard_nd_weight(self.in_proj_qkvz.weight)
+                        )
+                        self._use_weight_split = use_weight_split
                 if use_weight_split:
                     qkvz_weight = self.in_proj_qkvz.weight
                     mixed_qkv = torch.nn.functional.linear(hidden_states, qkvz_weight[:qkv_size])

@@ -3804,6 +3804,19 @@ class NPUModelRunner(GPUModelRunner):
                 if "sink" in name:
                     self._has_sinks = True
                     break
+            # Precompute the GDN qkvz weight-split decision on the real loaded
+            # NPU weights before torch.compile traces the forward; the NPU
+            # storage format is static but torch_npu.get_npu_format cannot run
+            # under compile tracing (fake tensors), so the value is baked in
+            # here as a plain Python bool (see AscendGatedDeltaNetAttention).
+            from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+                QwenGatedDeltaNetAttention as _QwenGatedDeltaNetAttention,
+            )
+            from vllm_ascend.ops.gdn import precompute_gdn_weight_split
+
+            for _module in self.model.modules():
+                if isinstance(_module, _QwenGatedDeltaNetAttention):
+                    precompute_gdn_weight_split(_module)
             if self.drafter:
                 logger.info("Loading drafter model...")
                 with get_tp_context(self.drafter):
