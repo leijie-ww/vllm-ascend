@@ -76,11 +76,40 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         super(UnquantizedFusedMoEMethod, self).process_weights_after_loading(layer)
 
         # Keep expert-aware loaders attached for later online weight updates.
-        w13_data = self._maybe_pad_weight(layer.w13_weight.data).transpose(1, 2).contiguous()
-        replace_parameter(layer, "w13_weight", w13_data)
+        #
+        # The first (dummy/checkpoint) load presents the parameters in the
+        # upstream fused-MoE layout, ``w13=[E, 2I, H]`` and ``w2=[E, H, I]``.
+        # Ascend kernels consume ``[E, H, 2I]``/``[E, I, H]`` after this
+        # transpose.  A colocated RL reload, however, calls ``model.load_weights``
+        # against those *already processed* parameters; the Qwen3.5-aware
+        # loader writes the incoming HF tensors directly into the processed
+        # orientation.  Transposing a second time would silently restore the
+        # upstream orientation and makes grouped_matmul see K=2I (256) instead
+        # of K=H (2048).  Detect the processed shape and leave it in place so
+        # this post-load hook is idempotent across reloads.
+        w13 = layer.w13_weight.data
+        w13_is_processed = (
+            w13.ndim == 3
+            and w13.shape[1] == self.moe.hidden_dim
+            and w13.shape[2] == 2 * self.moe.intermediate_size_per_partition
+        )
+        if w13_is_processed:
+            w13_data = self._maybe_pad_weight(w13)
+        else:
+            w13_data = self._maybe_pad_weight(w13).transpose(1, 2).contiguous()
+        replace_parameter(layer, "w13_weight", w13_data, prefer_copy=w13_is_processed)
 
-        w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(1, 2).contiguous()
-        replace_parameter(layer, "w2_weight", w2_data)
+        w2 = layer.w2_weight.data
+        w2_is_processed = (
+            w2.ndim == 3
+            and w2.shape[1] == self.moe.intermediate_size_per_partition
+            and w2.shape[2] == self.moe.hidden_dim
+        )
+        if w2_is_processed:
+            w2_data = self._maybe_pad_weight(w2)
+        else:
+            w2_data = self._maybe_pad_weight(w2).transpose(1, 2).contiguous()
+        replace_parameter(layer, "w2_weight", w2_data, prefer_copy=w2_is_processed)
 
         # TODO: Current dispatch_ffn_combine/mega_moe fusion operator ONLY supports NZ format.
         # Therefore, we must cast weights to NZ when fusion is enabled.

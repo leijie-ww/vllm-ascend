@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import json
+import os
+import time
 import weakref
 from collections.abc import Callable
 from contextlib import ExitStack
@@ -31,6 +34,48 @@ _STREAM_RESOURCE_ERROR_MARKERS = (
     "stream resources are insufficient",
 )
 _OLD_HDK_CAPTURE_ERROR_MARKERS = ("alloc sq cq fail",)
+
+
+def _record_aclgraph_test_event(phase: str, wrapper: Any, entry: "ACLGraphEntry") -> None:
+    """Optionally record graph capture/replay and current GDN buffer state."""
+    report_path = os.environ.get("ACLGRAPH_EVENT_REPORT")
+    if not report_path:
+        return
+    record: dict[str, Any] = {
+        "phase": phase,
+        "timestamp_ns": time.time_ns(),
+        "graph_id": id(entry.aclgraph) if entry.aclgraph is not None else None,
+        "batch_descriptor": repr(entry.batch_descriptor),
+        "runtime_mode": getattr(wrapper.runtime_mode, "name", str(wrapper.runtime_mode)),
+        "pid": os.getpid(),
+        "replay_index": int(getattr(wrapper, "_aclgraph_test_replay_index", 0)),
+    }
+    if phase in {"capture", "replay_before_submit"} and os.environ.get("ACLGRAPH_EVENT_CHECKSUM", "0") == "1":
+        try:
+            from vllm_ascend.ops.gdn import _get_base_conv1d, _get_packed_conv_weights
+
+            runnable = getattr(wrapper, "runnable", None)
+            for module_name, module in runnable.named_modules():
+                if not hasattr(module, "conv1d"):
+                    continue
+                base = _get_base_conv1d(module)
+                packed = _get_packed_conv_weights(module)
+                if not hasattr(base, "weight") or packed is None:
+                    continue
+                record.update(
+                    {
+                        "module": module_name,
+                        "base_ptr": int(base.weight.data_ptr()),
+                        "packed_ptr": int(packed.data_ptr()),
+                        "base_checksum": float(base.weight.float().sum().item()),
+                        "packed_checksum": float(packed.float().sum().item()),
+                    }
+                )
+                break
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            record["conv1d_snapshot_error"] = repr(exc)
+    with open(report_path, "a", encoding="utf-8") as report:
+        report.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 def _is_stream_resource_capture_error(exc: RuntimeError) -> bool:
@@ -114,6 +159,7 @@ class ACLGraphWrapper:
         self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
         self.enable_enpu = enable_enpu
         self.use_eagle = use_eagle
+        self._aclgraph_test_replay_index = 0
         _acl_graph_wrappers.add(self)
 
     def __getattr__(self, key: str):
@@ -233,6 +279,8 @@ class ACLGraphWrapper:
             entry.output = weak_ref_tensors(output)
             entry.aclgraph = aclgraph
 
+            _record_aclgraph_test_event("capture", self, entry)
+
             compilation_counter.num_cudagraph_captured += 1
 
             # important: we need to return the output, rather than
@@ -250,6 +298,8 @@ class ACLGraphWrapper:
             )
 
         logger.info_once("Replaying aclgraph")
+        self._aclgraph_test_replay_index += 1
+        _record_aclgraph_test_event("replay_enter", self, entry)
         # In async scheduling or multi-threaded (MT) scenarios, it is possible that
         # the CPU's record event (from update_attn_params) for the iteration i completes
         # before the grph replay of iteration i-1.
@@ -263,7 +313,10 @@ class ACLGraphWrapper:
         need_sync = self.runtime_mode == CUDAGraphMode.FULL and not is_draft_eagle
         if not self.enable_enpu and need_sync:
             torch.npu.current_stream().synchronize()
+        _record_aclgraph_test_event("replay_after_pre_sync", self, entry)
+        _record_aclgraph_test_event("replay_before_submit", self, entry)
         entry.aclgraph.replay()
+        _record_aclgraph_test_event("replay_submitted", self, entry)
         return entry.output
 
 
