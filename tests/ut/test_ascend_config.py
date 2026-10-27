@@ -731,6 +731,33 @@ class TestAscendConfig(TestBase):
             init_ascend_config(test_vllm_config)
 
     @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_init_ascend_config_allows_c8_mxfp_sync_memcache(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.cache_config.cache_dtype = "mxfp8"
+        test_vllm_config.kv_transfer_config = KVTransferConfig(
+            kv_connector="AscendStoreConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={"backend": "memcache"},
+        )
+
+        self.assertIsNotNone(init_ascend_config(test_vllm_config))
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_init_ascend_config_rejects_c8_mxfp_async_memcache(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.cache_config.cache_dtype = "mxfp8"
+        test_vllm_config.kv_transfer_config = KVTransferConfig(
+            kv_connector="AscendStoreConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={"backend": "memcache", "load_async": True},
+        )
+
+        with self.assertRaisesRegex(ValueError, "C8_MXFP KV transfer requires"):
+            init_ascend_config(test_vllm_config)
+
+    @_clean_up_ascend_config
     @patch("vllm_ascend.ascend_config.logger.warning")
     @patch(
         "vllm_ascend.device.hardware_profile.get_current_hardware_profile",

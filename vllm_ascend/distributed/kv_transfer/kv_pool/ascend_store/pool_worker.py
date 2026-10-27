@@ -107,6 +107,7 @@ from vllm_ascend.distributed.utils import (
     get_decode_context_model_parallel_rank,
     get_decode_context_model_parallel_world_size,
 )
+from vllm_ascend.utils import is_c8_mxfp_kv_quant
 
 # PERF-TUNE switch: defer the last layer's save drain out of the forward
 # critical path; the drain runs at the start of the next step's start_load_kv.
@@ -288,7 +289,9 @@ class KVPoolWorker:
             if self.use_layerwise and self.layerwise_protocol is not None
             else None
         )
-        self.kv_cache_group_families = infer_group_cache_families(kv_cache_groups, self.compress_ratios, self.hf_config)
+        self.kv_cache_group_families = infer_group_cache_families(
+            kv_cache_groups, self.compress_ratios, self.hf_config, c8_mxfp=is_c8_mxfp_kv_quant(vllm_config)
+        )
         self.group_uses_align_state = self._infer_group_uses_align_state()
         self.cache_transfer_granularity = infer_cache_transfer_granularity(
             self.grouped_block_size, self.lcm_block_size, self.cacheable_group_ids

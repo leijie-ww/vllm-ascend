@@ -245,13 +245,18 @@ def _get_group_spec_ratios(group: object) -> set[int | None]:
     return {getattr(kv_cache_spec, "compress_ratio", None)}
 
 
+_C8_MXFP_CACHE_FAMILY_SUFFIX = "|c8_mxfp_pa_nz_v1"
+_C8_MXFP_CACHE_FAMILY = "default" + _C8_MXFP_CACHE_FAMILY_SUFFIX
+
+
 def infer_group_cache_families(
     kv_cache_groups: Sequence[object] | None,
     compress_ratios: Sequence[int] | None,
     hf_config: Any | None = None,
+    c8_mxfp: bool = False,
 ) -> list[str]:
     if kv_cache_groups is None:
-        return ["default"]
+        return [_C8_MXFP_CACHE_FAMILY if c8_mxfp else "default"]
 
     families: list[str] = []
     for group in kv_cache_groups:
@@ -278,6 +283,16 @@ def infer_group_cache_families(
                 layer_names,
             )
             families.append("mixed")
+    if c8_mxfp:
+        for index, group in enumerate(kv_cache_groups):
+            spec = getattr(group, "kv_cache_spec", None)
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                specs = list(spec.kv_cache_specs.values())
+                full_attention = bool(specs) and all(isinstance(item, FullAttentionSpec) for item in specs)
+            else:
+                full_attention = isinstance(spec, FullAttentionSpec)
+            if full_attention:
+                families[index] += _C8_MXFP_CACHE_FAMILY_SUFFIX
     return families
 
 
@@ -497,6 +512,14 @@ class ChunkedTokenDatabase:
         addr_list: list[int] = []
         size_list: list[int] = []
         group_block_size = self.get_block_size(kv_cache_group_id)
+        if (
+            cache_role == "kv"
+            and self.group_cache_families.get("kv", {}).get(kv_cache_group_id, "").endswith(
+                _C8_MXFP_CACHE_FAMILY_SUFFIX
+            )
+            and (start % group_block_size or end - start != group_block_size)
+        ):
+            raise ValueError("C8_MXFP bulk MemCache transfer requires a complete aligned scheduler block.")
         if block_id is None:
             block_idx = start // group_block_size
             if block_idx >= len(block_ids):

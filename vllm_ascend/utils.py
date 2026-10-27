@@ -1571,6 +1571,25 @@ def uses_mooncake_connector(kv_transfer_config: Any) -> bool:
     return bool(_collect_kv_connector_names(kv_transfer_config) & mooncake_connector_names)
 
 
+def uses_c8_mxfp_sync_memcache(kv_transfer_config: Any) -> bool:
+    """Whether a direct AscendStore connector has the supported C8 bulk contract."""
+    if getattr(kv_transfer_config, "kv_connector", None) != "AscendStoreConnector":
+        return False
+    if getattr(kv_transfer_config, "kv_connector_module_path", None) is not None:
+        return False
+    if getattr(kv_transfer_config, "kv_role", None) != "kv_both":
+        return False
+    extra = getattr(kv_transfer_config, "kv_connector_extra_config", None)
+    return (
+        isinstance(extra, dict)
+        and extra.get("backend") == "memcache"
+        and extra.get("use_layerwise", False) is False
+        and extra.get("load_async", False) is False
+        and extra.get("discard_partial_chunks", True) is True
+        and extra.get("save_decode_cache", False) is False
+    )
+
+
 def _collect_kv_connector_names(value: Any) -> set[str]:
     connector_names: set[str] = set()
     if isinstance(value, dict):

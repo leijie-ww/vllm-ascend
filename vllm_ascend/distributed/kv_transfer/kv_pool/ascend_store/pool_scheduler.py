@@ -65,6 +65,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metrics import (
     AscendStoreKVConnectorStats,
 )
+from vllm_ascend.utils import is_c8_mxfp_kv_quant
 
 
 def _new_req_prefill_tokens(request: NewRequestData) -> list[int]:
@@ -110,7 +111,9 @@ class KVPoolScheduler:
             if kv_cache_config is not None and self.use_hybrid
             else [0]
         )
-        self.kv_cache_group_families = infer_group_cache_families(kv_cache_groups, self.compress_ratios, self.hf_config)
+        self.kv_cache_group_families = infer_group_cache_families(
+            kv_cache_groups, self.compress_ratios, self.hf_config, c8_mxfp=is_c8_mxfp_kv_quant(vllm_config)
+        )
         self.num_speculative_blocks_by_group = self._infer_mamba_groups()
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.consumer_is_to_load = vllm_config.kv_transfer_config.kv_connector_extra_config.get(

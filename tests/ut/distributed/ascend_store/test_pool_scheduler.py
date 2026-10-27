@@ -243,6 +243,20 @@ def test_mooncake_layerwise_accepts_aligned_recurrent_state(num_speculative_bloc
     )
 
 
+@patch(
+    "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.is_c8_mxfp_kv_quant",
+    return_value=True,
+)
+def test_c8_full_attention_scheduler_cache_family_is_versioned(_is_c8):
+    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import _C8_MXFP_CACHE_FAMILY
+
+    config = make_config(kv_role="kv_both", extra_config={"backend": "memcache"})
+    attention = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=4, dtype=torch.float8_e4m3fn)
+    plan = MagicMock(kv_cache_groups=[KVCacheGroupSpec(["layer.0"], attention)])
+    scheduler = KVPoolScheduler(config, use_layerwise=False, kv_cache_config=plan)
+    assert scheduler.kv_cache_group_families == [_C8_MXFP_CACHE_FAMILY]
+
+
 class TestGetZmqRpcPathLookup(unittest.TestCase):
     def test_rpc_path(self):
         cases = [({}, 0, 0), ({"lookup_rpc_port": 5555}, 1, 5555), ({"mooncake_rpc_port": 6666}, 0, 6666)]

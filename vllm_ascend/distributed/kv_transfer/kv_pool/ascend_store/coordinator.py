@@ -539,4 +539,4 @@ def _reachable_block_mask(
 
 
 def _uses_reachable_mask(cache_family: str | None) -> bool:
-    return cache_family in (None, "default", "c1")
+    return cache_family is None or cache_family.split("|", 1)[0] in ("default", "c1")

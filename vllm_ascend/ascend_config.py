@@ -722,6 +722,7 @@ class AscendConfig:
                 "prefill context parallelism (PCP) instead."
             )
         self._check_mooncake_c8_kv_cache_quant(vc)
+        self._check_c8_mxfp_kv_transfer(vc)
 
         # profiling_chunk vs min_chunk clamp
         if self.scheduler_config.profiling_chunk_config.enabled:
@@ -1050,6 +1051,23 @@ class AscendConfig:
             "The producer keeps KV cache in bf16 while the consumer allocates int8 KV cache, so raw "
             "Mooncake transfer would reinterpret bf16 bytes as int8. Please disable C8 KV cache quantization "
             "or use MooncakeLayerwiseConnector, which quantizes KV cache before transfer."
+        )
+
+    @staticmethod
+    def _check_c8_mxfp_kv_transfer(vllm_config: VllmConfig) -> None:
+        from vllm_ascend.utils import is_c8_mxfp_kv_quant, uses_c8_mxfp_sync_memcache, uses_mooncake_connector
+
+        transfer = getattr(vllm_config, "kv_transfer_config", None)
+        if transfer is None or not is_c8_mxfp_kv_quant(vllm_config):
+            return
+        if transfer.kv_connector != "MultiConnector" and (
+            uses_mooncake_connector(transfer) or uses_c8_mxfp_sync_memcache(transfer)
+        ):
+            return
+        raise ValueError(
+            "C8_MXFP KV transfer requires MooncakeConnectorV1 or direct AscendStoreConnector "
+            "with backend=memcache, kv_role=kv_both, use_layerwise=false, load_async=false, "
+            "discard_partial_chunks=true, and save_decode_cache=false."
         )
 
     def _check_mix_placement(self):

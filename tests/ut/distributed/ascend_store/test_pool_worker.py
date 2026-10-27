@@ -1207,6 +1207,18 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
     def setUp(self):
         self._patches = {}
 
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.is_c8_mxfp_kv_quant",
+        return_value=True,
+    )
+    def test_c8_full_attention_worker_cache_family_is_versioned(self, _is_c8):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import _C8_MXFP_CACHE_FAMILY
+
+        attention = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=4, dtype=torch.float8_e4m3fn)
+        plan = MagicMock(kv_cache_groups=[KVCacheGroupSpec(["layer.0"], attention)])
+        worker = make_worker(self, kv_cache_config=plan, num_layers=1)
+        self.assertEqual(worker.kv_cache_group_families, [_C8_MXFP_CACHE_FAMILY])
+
     def tearDown(self):
         self._stop_all()
 
@@ -1311,6 +1323,26 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         stats = worker.get_stats()
         self.assertEqual(stats.data["load_get_keys"], 1)
         self.assertEqual(len(stats.data["load_get_duration_seconds"]), 1)
+
+    def test_c8_mtp_tail_hit_loads_complete_scheduler_block(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import _C8_MXFP_CACHE_FAMILY
+
+        worker = self._make_worker(kv_role="kv_both", extra_config={"backend": "memcache"})
+        worker.m_store.get = MagicMock(return_value=[0])
+        worker.token_database.set_group_buffers(
+            {0: [1000, 2000, 3000, 4000]},
+            {0: [160, 160, 10, 10]},
+            group_cache_families={0: _C8_MXFP_CACHE_FAMILY},
+        )
+        load_spec = LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=15, can_load=True, token_len=15)
+        req = ReqMeta(req_id="mtp-tail", token_len_chunk=16, block_ids=[1], block_hashes=["h0"], load_spec=load_spec)
+        meta = AscendConnectorMetadata(set(), set())
+        meta.add_request(req)
+        worker.start_load_kv(meta)
+        assert load_spec.token_len == 16
+        _, addresses, sizes = worker.m_store.get.call_args.args
+        assert addresses == [[1160, 2160, 3010, 4010]]
+        assert sizes == [[160, 160, 10, 10]]
 
     @patch(
         "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.KVCacheStoreRecvingThread.start",
