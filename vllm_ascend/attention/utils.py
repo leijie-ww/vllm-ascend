@@ -287,7 +287,11 @@ def ascend_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
 
 def using_paged_attention(runtime_shape: int | None, vllm_config: VllmConfig, head_size: int | None = None) -> bool:
     """Check any configured PA shape for KV allocation when runtime_shape is None."""
-    if vllm_config.speculative_config is not None:
+    if vllm_config.speculative_config is not None and not (
+        head_size == FIA_TND_LARGE_HEAD_FALLBACK_HEAD_SIZE
+        and in_full_cudagraph_mode(vllm_config)
+        and getattr(getattr(vllm_config.model_config, "hf_text_config", None), "model_type", None) == "gemma4_text"
+    ):
         return False
     if not get_current_hardware_profile().supports(HardwareCapability.PAGED_ATTENTION):
         return False
@@ -410,7 +414,15 @@ def requires_contiguous_pa_kv_cache(layer, vllm_config: VllmConfig, spec: FullAt
         impl.sliding_window is None
         and getattr(vllm_config.model_config, "runner_type", None) != "pooling"
         and spec.page_size_bytes == spec.real_page_size_bytes
-        and using_paged_attention(None, vllm_config, spec.head_size)
+        and (
+            using_paged_attention(None, vllm_config, spec.head_size)
+            or (
+                getattr(getattr(vllm_config.model_config, "hf_text_config", None), "model_type", None)
+                == "gemma4_text"
+                and vllm_config.kv_transfer_config is not None
+                and spec.head_size == 512
+            )
+        )
     )
 
 

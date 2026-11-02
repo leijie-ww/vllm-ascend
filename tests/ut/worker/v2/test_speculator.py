@@ -531,6 +531,18 @@ def test_build_fia_params_prefill():
     assert result[0]["block_table"].shape == (4, 3)
 
 
+def test_build_fia_params_prefill_with_paged_attention():
+    speculator = AscendAutoRegressiveSpeculator.__new__(AscendAutoRegressiveSpeculator)
+    speculator.use_dcp = False
+    block_table = torch.arange(12).reshape(4, 3)
+    context_lens = torch.tensor([8, 9, 10, 0], dtype=torch.int32)
+    metadata = SimpleNamespace(block_tables=block_table, seq_lens=context_lens, pa_rows_expanded=True)
+
+    result = speculator.build_fia_params(4, {"draft": metadata}, True)
+
+    assert result == [{"layer_name": "draft", "context_lens": context_lens, "block_table": block_table}]
+
+
 def test_build_fia_params_decode():
     """Test building FIA parameters for decode."""
     speculator = AscendAutoRegressiveSpeculator.__new__(AscendAutoRegressiveSpeculator)
@@ -546,6 +558,26 @@ def test_build_fia_params_decode():
     assert result[0]["actual_seq_lengths"] == [1, 2, 3]
     assert result[0]["actual_seq_lengths_kv"] == [11, 30, 0]
     assert result[1]["actual_seq_lengths_kv"] == [12, 30, 0]
+
+
+def test_build_fia_params_decode_with_paged_attention():
+    speculator = AscendAutoRegressiveSpeculator.__new__(AscendAutoRegressiveSpeculator)
+    speculator.use_dcp = False
+    block_table = torch.arange(9).reshape(3, 3)
+    metadata = SimpleNamespace(block_tables=block_table, pa_rows_expanded=True)
+    speculator.input_batch = SimpleNamespace(num_reqs=2, seq_lens_np=np.array([10, 29]))
+    speculator.num_speculative_steps = 3
+    speculator.max_model_len = 30
+
+    with patch.object(AscendAutoRegressiveSpeculator, "advance_draft_positions", False):
+        result = speculator.build_fia_params(3, {"draft": metadata}, False)
+
+    assert len(result) == 2
+    for params in result:
+        assert params["layer_name"] == "draft"
+        assert params["block_table"] is block_table
+        assert torch.equal(params["context_lens"], torch.tensor([10, 29, 0], dtype=torch.int32))
+        assert "actual_seq_lengths" not in params
 
 
 def test_set_attn_detects_architecture():
@@ -848,3 +880,4 @@ def test_update_decode_attn_metadata_mla_with_dcp():
     assert update_kwargs["cp_kv_cache_interleave_size"] == 1
 
     assert torch.equal(metadata.seq_lens_cpu, expected)
+

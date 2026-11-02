@@ -172,7 +172,7 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
                 parallel_config=parallel_config,
                 cache_config=replace(self.vllm_config.cache_config),
             )
-        # V1 parity: swap in the draft model config after validation —
+        # V1 parity: swap in the draft model config after validation ?
         # re-validating would reject the dense head (fine-grained TP is MoE-only).
         draft_config.model_config = self.draft_model_config
         # replace() used to re-run post_init's is_moe_model recompute; mirror it.
@@ -854,12 +854,14 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
         # One graph task is registered per layer, so every layer needs its own
         # parameter set. bind() merges these over the captured kwargs without
         # filtering, and the captured op decides the names: B1 paged-verify
-        # tasks take block_table/actual_seq_kvlen (+ atten_mask), while FIA TND
-        # tasks take the cumulative query lengths.
+        # tasks take block_table/actual_seq_kvlen (+ atten_mask), FIA TND
+        # tasks take the cumulative query lengths, and PA tasks take context_lens.
         if is_draft_model_prefill:
             fia_params: list[dict[str, Any]] = []
             for layer_name, metadata in draft_attn_metadata.items():
-                if isinstance(metadata, AscendB1Metadata):
+                if getattr(metadata, "pa_rows_expanded", False):
+                    layer_params = {"context_lens": metadata.seq_lens, "block_table": metadata.block_tables}
+                elif isinstance(metadata, AscendB1Metadata):
                     layer_params = b1_verify_graph_params(layer_name, metadata)
                 else:
                     layer_params = {
@@ -883,7 +885,12 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
             ]
             seq_lens.extend([0] * (num_reqs_padded - num_reqs))
             for layer_name, metadata in draft_attn_metadata.items():
-                if isinstance(metadata, AscendB1Metadata):
+                if getattr(metadata, "pa_rows_expanded", False):
+                    layer_params = {
+                        "context_lens": torch.tensor(seq_lens, dtype=torch.int32),
+                        "block_table": metadata.block_tables,
+                    }
+                elif isinstance(metadata, AscendB1Metadata):
                     # Decode steps run one query per request, so the captured
                     # all-visible placeholder mask stays correct and only the
                     # per-step KV lengths and block table are rebound. FULL
@@ -994,3 +1001,4 @@ def torch_gather_wrapper():
         yield
     finally:
         torch.gather = original_gather
+

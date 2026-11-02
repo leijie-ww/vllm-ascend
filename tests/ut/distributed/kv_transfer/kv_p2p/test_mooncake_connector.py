@@ -1805,6 +1805,7 @@ class MockVllmConfig:
             model_type="qwen2",
         )
         self.model_config.get_num_layers = MagicMock(return_value=32)
+        self.model_config.get_total_num_kv_heads = MagicMock(return_value=8)
         self.parallel_config.tensor_parallel_size = 2
         self.parallel_config.data_parallel_rank = 0
         self.parallel_config.data_parallel_size = 1
@@ -3388,6 +3389,31 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         self.assertIsNotNone(worker.kv_send_thread)
         self.assertIsNone(worker.kv_recv_thread)
 
+    def test_heterogeneous_config_does_not_read_global_kv_head_count(self):
+        class HeterogeneousTextConfig:
+            model_type = "gemma4_text"
+
+            @property
+            def num_key_value_heads(self):
+                raise AssertionError("global per-layer KV head access")
+
+        self.vllm_config.model_config.hf_text_config = HeterogeneousTextConfig()
+
+        worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id, MockKVCacheConfig())
+
+        self.assertEqual(worker.num_key_value_heads, 8)
+
+    def test_register_kv_caches_ignores_shared_draft_alias(self):
+        worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id, MockKVCacheConfig())
+        shared_alias = "draft_model.layers.0.self_attn.attn"
+        kv_caches = dict(self.kv_caches)
+        kv_caches[shared_alias] = kv_caches["model.layers.0.self_attn"]
+
+        worker.register_kv_caches(kv_caches)
+
+        self.assertEqual(set(worker.kv_caches), set(self.kv_caches))
+        self.assertEqual(len(worker.xfer_handshake_metadata.kv_caches_base_addr), 1)
+
     def test_register_combined_attention_cache_preserves_views_and_kernel_scale(self):
         for num_blocks in (2, 5):
             for scale in (1, 3):
@@ -3687,6 +3713,7 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
                 ),
             ):
                 self.vllm_config.model_config.hf_text_config.num_key_value_heads = num_kv_heads
+                self.vllm_config.model_config.get_total_num_kv_heads.return_value = num_kv_heads
                 self.vllm_config.model_config.is_deepseek_mla = is_deepseek_mla
                 worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id, MockKVCacheConfig())
                 worker.tp_num_need_pulls = tp_num_need_pulls
@@ -4113,6 +4140,7 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         ):
             self.vllm_config.model_config.is_deepseek_mla = case["use_mla"]
             self.vllm_config.model_config.hf_text_config.num_key_value_heads = case["num_key_value_heads"]
+            self.vllm_config.model_config.get_total_num_kv_heads.return_value = case["num_key_value_heads"]
             worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id, MockKVCacheConfig())
 
         worker.use_mla = case["use_mla"]

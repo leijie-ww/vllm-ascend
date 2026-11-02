@@ -2189,7 +2189,7 @@ class MooncakeConnectorWorker:
                 "In P/D disaggregation, Mooncake supports PCP only on the prefill (kv_producer) engine. "
                 "Set prefill_context_parallel_size=1 on the decode (kv_consumer) engine."
             )
-        self.num_key_value_heads = self.vllm_config.model_config.hf_text_config.num_key_value_heads
+        self.num_key_value_heads = self.vllm_config.model_config.get_total_num_kv_heads()
 
         # kv cache config
         self.kv_cache_config = kv_cache_config
@@ -2625,9 +2625,16 @@ class MooncakeConnectorWorker:
 
         for kv_cache_tensor in self.kv_cache_config.kv_cache_tensors:
             shared_addrs: list[int] = []
+            shared_ends: list[int] = []
             for layer_name in get_kv_cache_tensor_layers(kv_cache_tensor):
                 for single_kv_cache in self._as_kv_cache_tuple(kv_caches[layer_name]):
-                    shared_addrs.append(single_kv_cache.data_ptr())
+                    start = single_kv_cache.data_ptr()
+                    span = single_kv_cache.element_size() + sum(
+                        (size - 1) * stride * single_kv_cache.element_size()
+                        for size, stride in zip(single_kv_cache.shape, single_kv_cache.stride())
+                    )
+                    shared_addrs.append(start)
+                    shared_ends.append(start + span)
 
             if not shared_addrs:
                 continue
@@ -2635,7 +2642,7 @@ class MooncakeConnectorWorker:
             if base_addr % KV_CACHE_BUFFER_ALIGNMENT != 0:
                 raise RuntimeError(f"Tensor start addr {base_addr} is not aligned to 2 MiB.")
             ptrs.append(base_addr)
-            lengths.append(kv_cache_tensor.size)
+            lengths.append(max(shared_ends) - base_addr)
 
         return ptrs, lengths
 
@@ -2658,6 +2665,9 @@ class MooncakeConnectorWorker:
 
         self.num_blocks = self.kv_cache_config.num_blocks
         logger.info("num_blocks: %s", self.num_blocks)
+        # init_kv_cache also returns aliases for layers that share another layer's KV.
+        # Only layers in the cache config own storage to register and transfer.
+        kv_caches = {name: cache for name, cache in kv_caches.items() if name in self._layer_specs}
         self.kv_caches = kv_caches
         # Maps each KV cache group to its serialized group spec and physical
         # layer indices: {group_id: (group_spec, [layer_idx0, layer_idx1, ...])}.

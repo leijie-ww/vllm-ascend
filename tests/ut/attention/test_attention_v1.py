@@ -36,6 +36,21 @@ LARGE_HEAD_PREFILL_PATH = "vllm_ascend.device.utils.npu_large_head_prefill_atten
 
 
 class TestAttentionGraphHelpers(TestBase):
+    def test_gemma4_pd_full_attention_requires_contiguous_kv_with_mtp(self):
+        impl = AscendAttentionBackendImpl.__new__(AscendAttentionBackendImpl)
+        impl.sliding_window = None
+        config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                runner_type="generate",
+                hf_text_config=SimpleNamespace(model_type="gemma4_text"),
+            ),
+            kv_transfer_config=object(),
+            speculative_config=object(),
+        )
+        spec = FullAttentionSpec(block_size=128, num_kv_heads=2, head_size=512, dtype=torch.bfloat16)
+
+        self.assertTrue(requires_contiguous_pa_kv_cache(SimpleNamespace(impl=impl), config, spec))
+
     @patch("vllm_ascend.attention.utils.using_paged_attention", return_value=True)
     def test_pa_contiguous_cache_requirement_is_limited_to_normal_impl(self, mock_using_pa):
         config = SimpleNamespace(model_config=SimpleNamespace(runner_type="generate"))
@@ -69,7 +84,7 @@ class TestAttentionGraphHelpers(TestBase):
     def test_paged_attention_allocation_checks_any_configured_shape(self):
         config = SimpleNamespace(
             speculative_config=None,
-            model_config=SimpleNamespace(is_hybrid=False),
+            model_config=SimpleNamespace(is_hybrid=False, hf_text_config=SimpleNamespace(model_type="gemma4_text")),
             compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY),
         )
         pa_config = SimpleNamespace(pa_shape_list=[32, 60])
@@ -99,6 +114,8 @@ class TestAttentionGraphHelpers(TestBase):
             self.assertTrue(using_paged_attention(60, config, head_size=512))
             config.speculative_config = object()
             self.assertFalse(using_paged_attention(None, config, head_size=512))
+            config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+            self.assertTrue(using_paged_attention(None, config, head_size=512))
             config.speculative_config = None
         with patch(
             "vllm_ascend.attention.utils.get_current_hardware_profile",
